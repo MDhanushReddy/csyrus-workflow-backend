@@ -22,10 +22,30 @@ from app.schemas import (
 
 router = APIRouter(prefix="/api", tags=["workflow"])
 settings = get_settings()
+DEFAULT_REVIEWER_EMAIL = "mdhanushreddydr@gmail.com"
 
 
 def is_reviewer(user: User) -> bool:
     return (user.role or "").lower() == "reviewer"
+
+
+def get_default_reviewer(db: Session) -> User:
+    reviewer = db.query(User).filter(User.email == DEFAULT_REVIEWER_EMAIL).first()
+    if not reviewer:
+        reviewer = User(
+            name="Dhanush Kumar Reddy",
+            email=DEFAULT_REVIEWER_EMAIL,
+            google_id=None,
+            role="reviewer",
+        )
+        db.add(reviewer)
+        db.commit()
+        db.refresh(reviewer)
+    elif reviewer.role != "reviewer":
+        reviewer.role = "reviewer"
+        db.commit()
+        db.refresh(reviewer)
+    return reviewer
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
@@ -51,6 +71,12 @@ def get_current_user(request: Request, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == email).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+
+    if user.email.lower() == DEFAULT_REVIEWER_EMAIL and user.role != "reviewer":
+        user.role = "reviewer"
+        db.commit()
+        db.refresh(user)
+
     return user
 
 
@@ -194,17 +220,14 @@ def create_request(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if payload.reviewer_id is not None:
-        reviewer = db.query(User).filter(User.id == payload.reviewer_id).first()
-        if not reviewer:
-            raise HTTPException(status_code=404, detail="Reviewer not found")
-
+    reviewer = get_default_reviewer(db)
     request = ApprovalRequest(
         title=payload.title,
         description=payload.description,
         priority=payload.priority,
         created_by=current_user.id,
-        reviewer_id=payload.reviewer_id,
+        reviewer_id=reviewer.id,
+        status="PENDING",
     )
     db.add(request)
     db.commit()
@@ -263,7 +286,7 @@ def update_request(
     request.title = payload.title
     request.description = payload.description
     request.priority = payload.priority
-    request.reviewer_id = payload.reviewer_id
+    request.reviewer_id = get_default_reviewer(db).id
     db.commit()
     db.refresh(request)
     return request
@@ -298,10 +321,20 @@ def reviewer_requests(
     if not is_reviewer(current_user):
         raise HTTPException(status_code=403, detail="Only reviewers can access this endpoint")
 
+    db.query(ApprovalRequest).filter(
+        ApprovalRequest.status == "PENDING",
+        ApprovalRequest.reviewer_id.is_(None),
+    ).update({ApprovalRequest.reviewer_id: current_user.id}, synchronize_session=False)
+    db.commit()
+
     return (
         db.query(ApprovalRequest)
         .filter(ApprovalRequest.reviewer_id == current_user.id)
-        .order_by(ApprovalRequest.created_at.desc())
+        .order_by(
+            ApprovalRequest.status.asc(),
+            ApprovalRequest.updated_at.desc(),
+            ApprovalRequest.created_at.desc(),
+        )
         .all()
     )
 
@@ -322,12 +355,13 @@ def approve_request(
         raise HTTPException(status_code=404, detail="Approval request not found")
     if request.status != "PENDING":
         raise HTTPException(status_code=400, detail="This request has already been reviewed")
-    if request.reviewer_id != current_user.id:
+    if request.reviewer_id not in (None, current_user.id):
         raise HTTPException(
             status_code=403,
             detail="Only the assigned reviewer can approve this request",
         )
 
+    request.reviewer_id = current_user.id
     review = ReviewAction(
         request_id=request_id,
         action="APPROVED",
@@ -357,12 +391,13 @@ def reject_request(
         raise HTTPException(status_code=404, detail="Approval request not found")
     if request.status != "PENDING":
         raise HTTPException(status_code=400, detail="This request has already been reviewed")
-    if request.reviewer_id != current_user.id:
+    if request.reviewer_id not in (None, current_user.id):
         raise HTTPException(
             status_code=403,
             detail="Only the assigned reviewer can reject this request",
         )
 
+    request.reviewer_id = current_user.id
     review = ReviewAction(
         request_id=request_id,
         action="REJECTED",
@@ -396,7 +431,7 @@ def create_review_action(
     if request.status != "PENDING":
         raise HTTPException(status_code=400, detail="This request has already been reviewed")
 
-    if request.reviewer_id != current_user.id:
+    if request.reviewer_id not in (None, current_user.id):
         raise HTTPException(
             status_code=403,
             detail="Only the assigned reviewer can act on this request",
@@ -405,6 +440,7 @@ def create_review_action(
     if payload.action not in {"APPROVED", "REJECTED"}:
         raise HTTPException(status_code=400, detail="Action must be APPROVED or REJECTED")
 
+    request.reviewer_id = current_user.id
     review = ReviewAction(
         request_id=payload.request_id,
         action=payload.action,
